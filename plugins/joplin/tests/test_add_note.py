@@ -26,6 +26,12 @@ class FakeJoplinState:
         self.notes = []
         self.tag_links = []
 
+    def live_notes(self):
+        return [note for note in self.notes if not note.get("deleted_time")]
+
+    def find_note(self, note_id):
+        return next((note for note in self.notes if note["id"] == note_id), None)
+
 
 class FakeJoplinHandler(BaseHTTPRequestHandler):
     state = None
@@ -71,9 +77,22 @@ class FakeJoplinHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/tags/") and parsed.path.endswith("/notes"):
             state.tag_links.append((parsed.path.split("/")[2], payload["id"]))
             return self._respond(200, {})
+        if parsed.path == "/notes" and self.command == "GET":
+            return self._respond(200, self._paginate(state.live_notes(), query))
+        if parsed.path.startswith("/folders/") and parsed.path.endswith("/notes"):
+            notebook_id = parsed.path.split("/")[2]
+            notes = [note for note in state.live_notes() if note.get("parent_id") == notebook_id]
+            return self._respond(200, self._paginate(notes, query))
+        if parsed.path.startswith("/notes/"):
+            note = state.find_note(parsed.path.split("/")[2])
+            if note is None:
+                return self._respond(404, {"error": "not found"})
+            if self.command == "PUT":
+                note.update(payload)
+            return self._respond(200, note)
         return self._respond(404, {"error": "not found"})
 
-    do_GET = do_POST = _handle
+    do_GET = do_POST = do_PUT = _handle
 
 
 class AddNoteTests(unittest.TestCase):
@@ -97,6 +116,17 @@ class AddNoteTests(unittest.TestCase):
 
     def add_notebook(self, title):
         self.state.notebooks.append({"id": "nb{}".format(len(self.state.notebooks)), "title": title})
+
+    def seed_note(self, title, body="", notebook_id="nb0", trashed=False):
+        note = {
+            "id": "{:032x}".format(len(self.state.notes) + 1),
+            "title": title,
+            "body": body,
+            "parent_id": notebook_id,
+            "deleted_time": 1 if trashed else 0,
+        }
+        self.state.notes.append(note)
+        return note["id"]
 
     def run_command(self, argv, body=""):
         arguments = add_note.build_parser().parse_args(argv)
@@ -187,6 +217,103 @@ class AddNoteTests(unittest.TestCase):
             with self.subTest(port=bad_port), mock.patch.dict(os.environ, {"JOPLIN_PORT": bad_port}):
                 with self.assertRaisesRegex(add_note.JoplinError, "JOPLIN_PORT"):
                     self.run_command(["notebooks"])
+
+    def test_join_appended_text_separates_with_one_blank_line(self):
+        self.assertEqual(add_note.join_appended_text("first", "second"), "first\n\nsecond")
+        self.assertEqual(add_note.join_appended_text("first\n", "second"), "first\n\nsecond")
+        self.assertEqual(add_note.join_appended_text("", "second"), "second")
+
+    def test_append_by_title_adds_text_and_keeps_existing_body(self):
+        self.seed_note("Log", body="first entry")
+        output = self.run_command(["append", "log"], body="second entry\n")
+        self.assertEqual(self.state.notes[0]["body"], "first entry\n\nsecond entry")
+        self.assertIn("Appended to note 'Log'", output)
+
+    def test_append_by_id_does_not_need_a_title_match(self):
+        note_id = self.seed_note("Log", body="first")
+        self.run_command(["append", note_id], body="second")
+        self.assertEqual(self.state.notes[0]["body"], "first\n\nsecond")
+
+    def test_append_finds_note_beyond_the_first_page_of_results(self):
+        for index in range(5):
+            self.seed_note("Filler {}".format(index))
+        self.seed_note("Target", body="old")
+        self.run_command(["append", "Target"], body="new")
+        self.assertEqual(self.state.notes[-1]["body"], "old\n\nnew")
+
+    def test_append_with_notebook_picks_the_right_note_among_duplicates(self):
+        self.add_notebook("Work")
+        self.add_notebook("Personal")
+        self.seed_note("Todo", body="work", notebook_id="nb0")
+        self.seed_note("Todo", body="home", notebook_id="nb1")
+        self.run_command(["append", "Todo", "--notebook", "personal"], body="more")
+        self.assertEqual([note["body"] for note in self.state.notes], ["work", "home\n\nmore"])
+
+    def test_ambiguous_title_lists_ids_and_notebooks_and_changes_nothing(self):
+        self.add_notebook("Work")
+        self.add_notebook("Personal")
+        first_id = self.seed_note("Todo", body="work", notebook_id="nb0")
+        self.seed_note("Todo", body="home", notebook_id="nb1")
+        with self.assertRaises(add_note.JoplinError) as context:
+            self.run_command(["append", "Todo"], body="more")
+        self.assertIn("2 notes are titled 'Todo'", str(context.exception))
+        self.assertIn("{} (notebook: Work)".format(first_id), str(context.exception))
+        self.assertIn("(notebook: Personal)", str(context.exception))
+        self.assertEqual([note["body"] for note in self.state.notes], ["work", "home"])
+
+    def test_default_notebook_setting_does_not_narrow_note_lookup(self):
+        self.add_notebook("Inbox")
+        self.add_notebook("Elsewhere")
+        self.seed_note("Log", body="a", notebook_id="nb1")
+        with mock.patch.dict(os.environ, {"JOPLIN_DEFAULT_NOTEBOOK": "Inbox"}):
+            self.run_command(["append", "Log"], body="b")
+        self.assertEqual(self.state.notes[0]["body"], "a\n\nb")
+
+    def test_unknown_title_and_unknown_id_are_reported(self):
+        self.seed_note("Log")
+        with self.assertRaisesRegex(add_note.JoplinError, "No note titled 'Missing'"):
+            self.run_command(["append", "Missing"], body="x")
+        with self.assertRaisesRegex(add_note.JoplinError, "No note with id " + "f" * 32):
+            self.run_command(["append", "f" * 32], body="x")
+
+    def test_trashed_note_is_rejected_by_id_and_hidden_from_title_lookup(self):
+        note_id = self.seed_note("Old", body="keep", trashed=True)
+        with self.assertRaisesRegex(add_note.JoplinError, "is in the trash"):
+            self.run_command(["append", note_id], body="x")
+        with self.assertRaisesRegex(add_note.JoplinError, "No note titled 'Old'"):
+            self.run_command(["rename", "Old", "New"])
+        self.assertEqual(self.state.notes[0]["body"], "keep")
+        self.assertEqual(self.state.notes[0]["title"], "Old")
+
+    def test_notebook_option_is_rejected_when_note_is_given_by_id(self):
+        self.add_notebook("Work")
+        note_id = self.seed_note("Log")
+        with self.assertRaisesRegex(add_note.JoplinError, "only applies when the note is given by title"):
+            self.run_command(["append", note_id, "--notebook", "Work"], body="x")
+
+    def test_empty_append_is_rejected_and_changes_nothing(self):
+        self.seed_note("Log", body="keep")
+        with self.assertRaisesRegex(add_note.JoplinError, "text to append cannot be empty"):
+            self.run_command(["append", "Log"], body="  \n")
+        self.assertEqual(self.state.notes[0]["body"], "keep")
+
+    def test_rename_by_title_changes_only_the_title(self):
+        self.seed_note("Old title", body="body stays")
+        output = self.run_command(["rename", "old TITLE", "New title"])
+        self.assertEqual(self.state.notes[0]["title"], "New title")
+        self.assertEqual(self.state.notes[0]["body"], "body stays")
+        self.assertIn("Renamed note 'Old title' to 'New title'", output)
+
+    def test_rename_by_id_works(self):
+        note_id = self.seed_note("Old title")
+        self.run_command(["rename", note_id, "New title"])
+        self.assertEqual(self.state.notes[0]["title"], "New title")
+
+    def test_rename_rejects_empty_new_title(self):
+        self.seed_note("Keep me")
+        with self.assertRaisesRegex(add_note.JoplinError, "new title cannot be empty"):
+            self.run_command(["rename", "Keep me", "   "])
+        self.assertEqual(self.state.notes[0]["title"], "Keep me")
 
     def test_main_prints_error_and_returns_nonzero(self):
         errors = io.StringIO()

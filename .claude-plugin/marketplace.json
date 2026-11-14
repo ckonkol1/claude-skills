@@ -6,7 +6,7 @@
     {
       "name": "joplin",
       "source": "./plugins/joplin",
-      "description": "Create Joplin notes from Claude Code using Joplin's local Data API."
+      "description": "Create, append to, and rename Joplin notes from Claude Code using Joplin's local Data API."
     }
   ]
 }
