@@ -1,0 +1,12 @@
+{
+  "name": "claude-skills",
+  "description": "Claude Code skills for personal productivity tools.",
+  "owner": { "name": "Christie Konkol" },
+  "plugins": [
+    {
+      "name": "joplin",
+      "source": "./plugins/joplin",
+      "description": "Create Joplin notes from Claude Code using Joplin's local Data API."
+    }
+  ]
+}
