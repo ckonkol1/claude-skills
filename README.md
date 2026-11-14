@@ -1,6 +1,6 @@
 # claude-skills
 
-Claude Code plugin marketplace with skills for personal productivity tools, starting with Joplin note-taking via its local Data API.
+Claude Code skills for personal productivity tools, starting with Joplin note-taking via its local Data API.
 
 ## Plugins
 
